@@ -120,16 +120,6 @@ class TestIOStreamMixin(object):
 
         def accept_callback(connection, address):
             streams[0] = self._make_server_iostream(connection, **kwargs)
-            if isinstance(streams[0], SSLIOStream):
-                # HACK: The SSL handshake won't complete (and
-                # therefore the client connect callback won't be
-                # run)until the server side has tried to do something
-                # with the connection.  For these tests we want both
-                # sides to connect before we do anything else with the
-                # connection, so we must cause some dummy activity on the
-                # server.  If this turns out to be useful for real apps
-                # it should have a cleaner interface.
-                streams[0]._add_io_state(IOLoop.READ)
             self.stop()
 
         def connect_callback():
@@ -542,4 +532,22 @@ class TestPipeIOStream(AsyncTestCase):
         data = self.wait()
         self.assertEqual(data, b"ld")
 
+        rs.close()
+
+    def test_pipe_iostream_big_write(self):
+        r, w = os.pipe()
+
+        rs = PipeIOStream(r, io_loop=self.io_loop)
+        ws = PipeIOStream(w, io_loop=self.io_loop)
+
+        NUM_BYTES = 1048576
+
+        # Write 1MB of data, which should fill the buffer
+        ws.write(b"1" * NUM_BYTES)
+
+        rs.read_bytes(NUM_BYTES, self.stop)
+        data = self.wait()
+        self.assertEqual(data, b"1" * NUM_BYTES)
+
+        ws.close()
         rs.close()

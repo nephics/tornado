@@ -219,16 +219,31 @@ class StackContextTest(AsyncTestCase):
     def test_yield_in_with(self):
         @gen.engine
         def f():
-            with StackContext(functools.partial(self.context, 'c1')):
-                # This yield is a problem: the generator will be suspended
-                # and the StackContext's __exit__ is not called yet, so
-                # the context will be left on _state.contexts for anything
-                # that runs before the yield resolves.
-                yield gen.Task(self.io_loop.add_callback)
+            try:
+                self.callback = yield gen.Callback('a')
+                with StackContext(functools.partial(self.context, 'c1')):
+                    # This yield is a problem: the generator will be suspended
+                    # and the StackContext's __exit__ is not called yet, so
+                    # the context will be left on _state.contexts for anything
+                    # that runs before the yield resolves.
+                    yield gen.Wait('a')
+            except StackContextInconsistentError:
+                # In python <= 3.3, this suspended generator is never garbage
+                # collected, so it remains suspended in the 'yield' forever.
+                # Starting in 3.4, it is made collectable by raising
+                # a GeneratorExit exception from the yield, which gets
+                # converted into a StackContextInconsistentError by the
+                # exit of the 'with' block.
+                pass
 
         with self.assertRaises(StackContextInconsistentError):
             f()
             self.wait()
+        # Cleanup: to avoid GC warnings (which for some reason only seem
+        # to show up on py33-asyncio), invoke the callback (which will do
+        # nothing since the gen.Runner is already finished) and delete it.
+        self.callback()
+        del self.callback
 
     @gen_test
     def test_yield_outside_with(self):
@@ -242,8 +257,11 @@ class StackContextTest(AsyncTestCase):
         # As above, but with ExceptionStackContext instead of StackContext.
         @gen.engine
         def f():
-            with ExceptionStackContext(lambda t, v, tb: False):
-                yield gen.Task(self.io_loop.add_callback)
+            try:
+                with ExceptionStackContext(lambda t, v, tb: False):
+                    yield gen.Task(self.io_loop.add_callback)
+            except StackContextInconsistentError:
+                pass
 
         with self.assertRaises(StackContextInconsistentError):
             f()
@@ -256,12 +274,13 @@ class StackContextTest(AsyncTestCase):
             self.io_loop.add_callback(cb)
         yield gen.Wait('k1')
 
+    @gen_test
     def test_run_with_stack_context(self):
         @gen.coroutine
         def f1():
             self.assertEqual(self.active_contexts, ['c1'])
             yield run_with_stack_context(
-                StackContext(functools.partial(self.context, 'c1')),
+                StackContext(functools.partial(self.context, 'c2')),
                 f2)
             self.assertEqual(self.active_contexts, ['c1'])
 
@@ -272,7 +291,7 @@ class StackContextTest(AsyncTestCase):
             self.assertEqual(self.active_contexts, ['c1', 'c2'])
 
         self.assertEqual(self.active_contexts, [])
-        run_with_stack_context(
+        yield run_with_stack_context(
             StackContext(functools.partial(self.context, 'c1')),
             f1)
         self.assertEqual(self.active_contexts, [])

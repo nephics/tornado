@@ -13,6 +13,11 @@ from tornado.netutil import Resolver
 from tornado.options import define, options, add_parse_callback
 from tornado.test.util import unittest
 
+try:
+    reduce  # py2
+except NameError:
+    from functools import reduce  # py3
+
 TEST_MODULES = [
     'tornado.httputil.doctests',
     'tornado.iostream.doctests',
@@ -86,7 +91,8 @@ if __name__ == '__main__':
     logging.getLogger("tornado.access").setLevel(logging.CRITICAL)
 
     define('httpclient', type=str, default=None,
-           callback=AsyncHTTPClient.configure)
+           callback=lambda s: AsyncHTTPClient.configure(
+               s, defaults=dict(allow_ipv6=False)))
     define('ioloop', type=str, default=None)
     define('ioloop_time_monotonic', default=False)
     define('resolver', type=str, default=None,

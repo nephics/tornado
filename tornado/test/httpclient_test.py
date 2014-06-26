@@ -8,6 +8,7 @@ from contextlib import closing
 import functools
 import sys
 import threading
+import time
 
 from tornado.escape import utf8
 from tornado.httpclient import HTTPRequest, HTTPResponse, _RequestProxy, HTTPError, HTTPClient
@@ -309,7 +310,7 @@ Transfer-Encoding: chunked
         self.assertIs(exc_info[0][0], ZeroDivisionError)
 
     def test_configure_defaults(self):
-        defaults = dict(user_agent='TestDefaultUserAgent')
+        defaults = dict(user_agent='TestDefaultUserAgent', allow_ipv6=False)
         # Construct a new instance of the configured client class
         client = self.http_client.__class__(self.io_loop, force_instance=True,
                                             defaults=defaults)
@@ -387,6 +388,19 @@ Transfer-Encoding: chunked
                               allow_nonstandard_methods=True)
         self.assertEqual(response.body, b'OTHER')
 
+    @gen_test
+    def test_body(self):
+        hello_url = self.get_url('/hello')
+        with self.assertRaises(AssertionError) as context:
+            yield self.http_client.fetch(hello_url, body='data')
+
+        self.assertTrue('must be empty' in str(context.exception))
+
+        with self.assertRaises(AssertionError) as context:
+            yield self.http_client.fetch(hello_url, method='POST')
+
+        self.assertTrue('must not be empty' in str(context.exception))
+
 
 class RequestProxyTest(unittest.TestCase):
     def test_request_set(self):
@@ -433,17 +447,22 @@ class HTTPResponseTestCase(unittest.TestCase):
 
 class SyncHTTPClientTest(unittest.TestCase):
     def setUp(self):
-        if IOLoop.configured_class().__name__ == 'TwistedIOLoop':
+        if IOLoop.configured_class().__name__ in ('TwistedIOLoop',
+                                                  'AsyncIOMainLoop'):
             # TwistedIOLoop only supports the global reactor, so we can't have
             # separate IOLoops for client and server threads.
+            # AsyncIOMainLoop doesn't work with the default policy
+            # (although it could with some tweaks to this test and a
+            # policy that created loops for non-main threads).
             raise unittest.SkipTest(
-                'Sync HTTPClient not compatible with TwistedIOLoop')
+                'Sync HTTPClient not compatible with TwistedIOLoop or '
+                'AsyncIOMainLoop')
         self.server_ioloop = IOLoop()
 
         sock, self.port = bind_unused_port()
         app = Application([('/', HelloWorldHandler)])
-        server = HTTPServer(app, io_loop=self.server_ioloop)
-        server.add_socket(sock)
+        self.server = HTTPServer(app, io_loop=self.server_ioloop)
+        self.server.add_socket(sock)
 
         self.server_thread = threading.Thread(target=self.server_ioloop.start)
         self.server_thread.start()
@@ -451,7 +470,10 @@ class SyncHTTPClientTest(unittest.TestCase):
         self.http_client = HTTPClient()
 
     def tearDown(self):
-        self.server_ioloop.add_callback(self.server_ioloop.stop)
+        def stop_server():
+            self.server.stop()
+            self.server_ioloop.stop()
+        self.server_ioloop.add_callback(stop_server)
         self.server_thread.join()
         self.http_client.close()
         self.server_ioloop.close(all_fds=True)
@@ -469,3 +491,28 @@ class SyncHTTPClientTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as assertion:
             self.http_client.fetch(self.get_url('/notfound'))
         self.assertEqual(assertion.exception.code, 404)
+
+
+class HTTPRequestTestCase(unittest.TestCase):
+    def test_headers(self):
+        request = HTTPRequest('http://example.com', headers={'foo': 'bar'})
+        self.assertEqual(request.headers, {'foo': 'bar'})
+
+    def test_headers_setter(self):
+        request = HTTPRequest('http://example.com')
+        request.headers = {'bar': 'baz'}
+        self.assertEqual(request.headers, {'bar': 'baz'})
+
+    def test_null_headers_setter(self):
+        request = HTTPRequest('http://example.com')
+        request.headers = None
+        self.assertEqual(request.headers, {})
+
+    def test_body(self):
+        request = HTTPRequest('http://example.com', body='foo')
+        self.assertEqual(request.body, utf8('foo'))
+
+    def test_body_setter(self):
+        request = HTTPRequest('http://example.com')
+        request.body = 'foo'
+        self.assertEqual(request.body, utf8('foo'))

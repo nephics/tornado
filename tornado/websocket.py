@@ -20,7 +20,6 @@ communication between the browser and server.
 from __future__ import absolute_import, division, print_function, with_statement
 # Author: Jacob Kristhammar, 2010
 
-import array
 import base64
 import collections
 import functools
@@ -31,23 +30,26 @@ import time
 import tornado.escape
 import tornado.web
 
-from tornado.concurrent import Future
+from tornado.concurrent import TracebackFuture
 from tornado.escape import utf8, native_str
-from tornado import httpclient
+from tornado import httpclient, httputil
 from tornado.ioloop import IOLoop
 from tornado.iostream import StreamClosedError
 from tornado.log import gen_log, app_log
 from tornado.netutil import Resolver
 from tornado import simple_httpclient
-from tornado.util import bytes_type, unicode_type
-
-try:
-    xrange  # py2
-except NameError:
-    xrange = range  # py3
+from tornado.util import bytes_type, unicode_type, _websocket_mask
 
 
 class WebSocketError(Exception):
+    pass
+
+
+class WebSocketClosedError(WebSocketError):
+    """Raised by operations on a closed connection.
+
+    .. versionadded:: 3.2
+    """
     pass
 
 
@@ -159,7 +161,15 @@ class WebSocketHandler(tornado.web.RequestHandler):
         encoded as json).  If the ``binary`` argument is false, the
         message will be sent as utf8; in binary mode any byte string
         is allowed.
+
+        If the connection is already closed, raises `WebSocketClosedError`.
+
+        .. versionchanged:: 3.2
+           `WebSocketClosedError` was added (previously a closed connection
+           would raise an `AttributeError`)
         """
+        if self.ws_connection is None:
+            raise WebSocketClosedError()
         if isinstance(message, dict):
             message = tornado.escape.json_encode(message)
         self.ws_connection.write_message(message, binary=binary)
@@ -195,6 +205,8 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
     def ping(self, data):
         """Send ping frame to the remote end."""
+        if self.ws_connection is None:
+            raise WebSocketClosedError()
         self.ws_connection.write_ping(data)
 
     def on_pong(self, data):
@@ -210,8 +222,9 @@ class WebSocketHandler(tornado.web.RequestHandler):
 
         Once the close handshake is successful the socket will be closed.
         """
-        self.ws_connection.close()
-        self.ws_connection = None
+        if self.ws_connection:
+            self.ws_connection.close()
+            self.ws_connection = None
 
     def allow_draft76(self):
         """Override to enable support for the older "draft76" protocol.
@@ -362,12 +375,12 @@ class WebSocketProtocol76(WebSocketProtocol):
             "Sec-WebSocket-Location: %(scheme)s://%(host)s%(uri)s\r\n"
             "%(subprotocol)s"
             "\r\n" % (dict(
-            version=tornado.version,
-            origin=self.request.headers["Origin"],
-            scheme=scheme,
-            host=self.request.host,
-            uri=self.request.uri,
-            subprotocol=subprotocol_header))))
+                version=tornado.version,
+                origin=self.request.headers["Origin"],
+                scheme=scheme,
+                host=self.request.host,
+                uri=self.request.uri,
+                subprotocol=subprotocol_header))))
         self.stream.read_bytes(8, self._handle_challenge)
 
     def challenge_response(self, challenge):
@@ -577,7 +590,7 @@ class WebSocketProtocol13(WebSocketProtocol):
             frame += struct.pack("!BQ", 127 | mask_bit, l)
         if self.mask_outgoing:
             mask = os.urandom(4)
-            data = mask + self._apply_mask(mask, data)
+            data = mask + _websocket_mask(mask, data)
         frame += data
         self.stream.write(frame)
 
@@ -662,21 +675,8 @@ class WebSocketProtocol13(WebSocketProtocol):
         except StreamClosedError:
             self._abort()
 
-    def _apply_mask(self, mask, data):
-        mask = array.array("B", mask)
-        unmasked = array.array("B", data)
-        for i in xrange(len(data)):
-            unmasked[i] = unmasked[i] ^ mask[i % 4]
-        if hasattr(unmasked, 'tobytes'):
-            # tostring was deprecated in py32.  It hasn't been removed,
-            # but since we turn on deprecation warnings in our tests
-            # we need to use the right one.
-            return unmasked.tobytes()
-        else:
-            return unmasked.tostring()
-
     def _on_masked_frame_data(self, data):
-        self._on_frame_data(self._apply_mask(self._frame_mask, data))
+        self._on_frame_data(_websocket_mask(self._frame_mask, data))
 
     def _on_frame_data(self, data):
         if self._frame_opcode_is_control:
@@ -762,9 +762,13 @@ class WebSocketProtocol13(WebSocketProtocol):
 
 
 class WebSocketClientConnection(simple_httpclient._HTTPConnection):
-    """WebSocket client connection."""
+    """WebSocket client connection.
+
+    This class should not be instantiated directly; use the
+    `websocket_connect` function instead.
+    """
     def __init__(self, io_loop, request):
-        self.connect_future = Future()
+        self.connect_future = TracebackFuture()
         self.read_future = None
         self.read_queue = collections.deque()
         self.key = base64.b64encode(os.urandom(16))
@@ -784,9 +788,19 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
             io_loop, None, request, lambda: None, self._on_http_response,
             104857600, self.resolver)
 
+    def close(self):
+        """Closes the websocket connection.
+
+        .. versionadded:: 3.2
+        """
+        if self.protocol is not None:
+            self.protocol.close()
+            self.protocol = None
+
     def _on_close(self):
         self.on_message(None)
         self.resolver.close()
+        super(WebSocketClientConnection, self)._on_close()
 
     def _on_http_response(self, response):
         if not self.connect_future.done():
@@ -825,7 +839,7 @@ class WebSocketClientConnection(simple_httpclient._HTTPConnection):
         ready.
         """
         assert self.read_future is None
-        future = Future()
+        future = TracebackFuture()
         if self.read_queue:
             future.set_result(self.read_queue.popleft())
         else:
@@ -850,10 +864,20 @@ def websocket_connect(url, io_loop=None, callback=None, connect_timeout=None):
 
     Takes a url and returns a Future whose result is a
     `WebSocketClientConnection`.
+
+    .. versionchanged:: 3.2
+       Also accepts ``HTTPRequest`` objects in place of urls.
     """
     if io_loop is None:
         io_loop = IOLoop.current()
-    request = httpclient.HTTPRequest(url, connect_timeout=connect_timeout)
+    if isinstance(url, httpclient.HTTPRequest):
+        assert connect_timeout is None
+        request = url
+        # Copy and convert the headers dict/object (see comments in
+        # AsyncHTTPClient.fetch)
+        request.headers = httputil.HTTPHeaders(request.headers)
+    else:
+        request = httpclient.HTTPRequest(url, connect_timeout=connect_timeout)
     request = httpclient._RequestProxy(
         request, httpclient.HTTPRequest._DEFAULTS)
     conn = WebSocketClientConnection(io_loop, request)

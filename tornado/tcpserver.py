@@ -180,7 +180,8 @@ class TCPServer(object):
         between any server code.
 
         Note that multiple processes are not compatible with the autoreload
-        module (or the ``debug=True`` option to `tornado.web.Application`).
+        module (or the ``autoreload=True`` option to `tornado.web.Application`
+        which defaults to True when ``debug=True``).
         When using multiple processes, no IOLoops can be created or
         referenced until after the call to ``TCPServer.start(n)``.
         """
@@ -229,7 +230,7 @@ class TCPServer(object):
                 # catch another error later on (AttributeError in
                 # SSLIOStream._do_ssl_handshake).
                 # To test this behavior, try nmap with the -sT flag.
-                # https://github.com/facebook/tornado/pull/750
+                # https://github.com/tornadoweb/tornado/pull/750
                 if err.args[0] in (errno.ECONNABORTED, errno.EINVAL):
                     return connection.close()
                 else:

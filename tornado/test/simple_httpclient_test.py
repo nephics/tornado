@@ -14,6 +14,7 @@ from tornado.httpclient import AsyncHTTPClient
 from tornado.httputil import HTTPHeaders
 from tornado.ioloop import IOLoop
 from tornado.log import gen_log
+from tornado.netutil import Resolver
 from tornado.simple_httpclient import SimpleAsyncHTTPClient, _DEFAULT_CA_CERTS
 from tornado.test.httpclient_test import ChunkHandler, CountdownHandler, HelloWorldHandler
 from tornado.test import httpclient_test
@@ -122,9 +123,9 @@ class SimpleHTTPClientTestMixin(object):
                         SimpleAsyncHTTPClient(self.io_loop,
                                               force_instance=True))
         # different IOLoops use different objects
-        io_loop2 = IOLoop()
-        self.assertTrue(SimpleAsyncHTTPClient(self.io_loop) is not
-                        SimpleAsyncHTTPClient(io_loop2))
+        with closing(IOLoop()) as io_loop2:
+            self.assertTrue(SimpleAsyncHTTPClient(self.io_loop) is not
+                            SimpleAsyncHTTPClient(io_loop2))
 
     def test_connection_limit(self):
         with closing(self.create_client(max_clients=2)) as client:
@@ -296,6 +297,22 @@ class SimpleHTTPClientTestMixin(object):
             self.assertTrue(expected_message in str(response.error),
                             response.error)
 
+    def test_queue_timeout(self):
+        with closing(self.create_client(max_clients=1)) as client:
+            client.fetch(self.get_url('/trigger'), self.stop,
+                         request_timeout=10)
+            # Wait for the trigger request to block, not complete.
+            self.wait()
+            client.fetch(self.get_url('/hello'), self.stop,
+                         connect_timeout=0.1)
+            response = self.wait()
+
+            self.assertEqual(response.code, 599)
+            self.assertTrue(response.request_time < 1, response.request_time)
+            self.assertEqual(str(response.error), "HTTP 599: Timeout")
+            self.triggers.popleft()()
+            self.wait()
+
 
 class SimpleHTTPClientTestCase(SimpleHTTPClientTestMixin, AsyncHTTPTestCase):
     def setUp(self):
@@ -396,3 +413,23 @@ class HostnameMappingTestCase(AsyncHTTPTestCase):
         response = self.wait()
         response.rethrow()
         self.assertEqual(response.body, b'Hello world!')
+
+
+class ResolveTimeoutTestCase(AsyncHTTPTestCase):
+    def setUp(self):
+        # Dummy Resolver subclass that never invokes its callback.
+        class BadResolver(Resolver):
+            def resolve(self, *args, **kwargs):
+                pass
+
+        super(ResolveTimeoutTestCase, self).setUp()
+        self.http_client = SimpleAsyncHTTPClient(
+            self.io_loop,
+            resolver=BadResolver())
+
+    def get_app(self):
+        return Application([url("/hello", HelloWorldHandler), ])
+
+    def test_resolve_timeout(self):
+        response = self.fetch('/hello', connect_timeout=0.1)
+        self.assertEqual(response.code, 599)
